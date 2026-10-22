@@ -25,11 +25,16 @@ cd lan-audit
 ## Uso
 
 ```bash
-lan-audit --quick          # descubrimiento + top-200 puertos
+lan-audit --quick          # todas las redes de interfaces UP
 lan-audit --full           # top-1000 + scripts NSE seguros + BT
 lan-audit --full --no-bt   # sin Bluetooth
 lan-audit --cidr 192.168.1.0/24
+lan-audit --cidr 192.168.1.0/24 --cidr 10.141.197.0/24   # dos redes
 ```
+
+Con **dos Wi‑Fi**, conecta ambos adaptadores (p. ej. `HOUSE` + `HOUSE2`) y lanza `lan-audit`:
+escanea **todas** las subredes activas y todos los hosts alcanzables en ellas.
+No escanea SSIDs a los que no estás asociado.
 
 Informes en:
 

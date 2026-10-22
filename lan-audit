@@ -3,10 +3,10 @@
 # Uso: lan-audit [--quick|--full] [--no-bt] [--cidr 192.168.1.0/24] [--out DIR]
 set -euo pipefail
 
-VERSION=1.1.0
+VERSION=1.2.0
 MODE=full          # quick|full
 DO_BT=1
-CIDR=""
+CIDRS=()           # one or more networks; empty → auto-detect all up ifaces
 OUT_BASE="${HOME}/.local/share/lan-audits"
 NOTIFY=${NOTIFY:-1}
 TOP_PORTS=1000
@@ -17,13 +17,19 @@ usage() {
 lan-audit v${VERSION} — inventario LAN/BT + informe de vulnerabilidades
 
 Usage:
-  lan-audit [--quick|--full] [--no-bt] [--cidr X.X.X.0/24] [--out DIR]
+  lan-audit [--quick|--full] [--no-bt] [--cidr X.X.X.0/24]... [--out DIR]
 
   --quick   Host discovery + top-200 ports (más rápido)
   --full    Top-1000 ports + banners HTTP/SSL + scripts NSE seguros (default)
   --no-bt   Saltar escaneo Bluetooth
-  --cidr    Red a auditar (default: detecta la Wi-Fi/Ethernet activa)
+  --cidr    Red a auditar (repetible). Por defecto: TODAS las interfaces
+            IPv4 activas (p. ej. dos Wi‑Fi conectadas a la vez)
   --out     Directorio base de informes (default: ~/.local/share/lan-audits)
+
+Ejemplos:
+  lan-audit --quick
+  lan-audit --cidr 192.168.1.0/24 --cidr 10.141.197.0/24
+  # Con 2 adaptadores Wi‑Fi conectados, detecta ambas redes solo.
 
 EOF
 }
@@ -43,7 +49,11 @@ while [[ $# -gt 0 ]]; do
     --quick) MODE=quick; TOP_PORTS=200; shift ;;
     --full) MODE=full; TOP_PORTS=1000; shift ;;
     --no-bt) DO_BT=0; shift ;;
-    --cidr) CIDR=${2:-}; shift 2 ;;
+    --cidr)
+      [[ -n "${2:-}" ]] || die "--cidr requiere un valor"
+      CIDRS+=("$2")
+      shift 2
+      ;;
     --out) OUT_BASE=${2:-}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "opción desconocida: $1" ;;
@@ -53,18 +63,27 @@ done
 command -v nmap >/dev/null || die "nmap no instalado (pacman -S nmap)"
 command -v ip >/dev/null || die "iproute2 requerido"
 
-detect_cidr() {
-  local iface gw
-  iface=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-  [[ -n "$iface" ]] || die "no hay ruta default — ¿conectado a Wi-Fi?"
-  ip -4 -o addr show dev "$iface" 2>/dev/null \
-    | awk '{print $4; exit}' \
-    | awk -F'[./]' '{
-        ip=sprintf("%d.%d.%d.0", $1,$2,$3)
-        # assume /24 for typical home Wi-Fi if prefix odd
-        p=$5+0; if(p<8||p>30) p=24
-        print ip "/" p
-      }'
+# Convert addr/prefix → network CIDR (best-effort /24-style network address)
+addr_to_cidr() {
+  local cidr=$1
+  echo "$cidr" | awk -F'[./]' '{
+    a=$1+0; b=$2+0; c=$3+0; d=$4+0; p=$5+0
+    if (p<8 || p>30) p=24
+    if (p >= 24) { d=0 }
+    else if (p >= 16) { c=0; d=0 }
+    else if (p >= 8) { b=0; c=0; d=0 }
+    printf "%d.%d.%d.%d/%d\n", a,b,c,d,p
+  }'
+}
+
+# All non-loopback IPv4 interfaces that are UP
+detect_all_cidrs() {
+  local iface addr
+  while read -r iface addr; do
+    [[ -z "$iface" || -z "$addr" ]] && continue
+    [[ "$iface" == lo ]] && continue
+    addr_to_cidr "$addr"
+  done < <(ip -4 -o addr show scope global up 2>/dev/null | awk '{print $2, $4}')
 }
 
 IFACE=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
@@ -73,10 +92,37 @@ SELF_IP=$(ip -4 -o addr show dev "${IFACE:-lo}" 2>/dev/null | awk '{print $4}' |
 SELF_MAC=$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null || echo unknown)
 HOSTNAME_NOW=$(hostname 2>/dev/null || echo unknown)
 
-if [[ -z "$CIDR" ]]; then
-  CIDR=$(detect_cidr)
+# Map: list of "iface|cidr|self_ip|gateway" for the report
+NET_MAP_FILE=""
+
+if [[ ${#CIDRS[@]} -eq 0 ]]; then
+  mapfile -t CIDRS < <(detect_all_cidrs | sort -u)
 fi
-[[ -n "$CIDR" ]] || die "no se pudo detectar CIDR"
+[[ ${#CIDRS[@]} -gt 0 ]] || die "no se detectó ninguna red IPv4 activa — ¿Wi‑Fi conectada?"
+
+# Build per-network metadata
+build_net_meta() {
+  local cidr iface addr gw selfip
+  for cidr in "${CIDRS[@]}"; do
+    iface=""
+    selfip=""
+    gw=""
+    while read -r ifc ad; do
+      local net
+      net=$(addr_to_cidr "$ad")
+      if [[ "$net" == "$cidr" ]]; then
+        iface=$ifc
+        selfip=${ad%%/*}
+        break
+      fi
+    done < <(ip -4 -o addr show scope global up 2>/dev/null | awk '{print $2, $4}')
+    if [[ -n "$iface" ]]; then
+      gw=$(ip route show 2>/dev/null | awk -v d="$iface" '/^default/ && $0 ~ "dev "d {print $3; exit}')
+      [[ -z "$gw" ]] && gw=$(ip route show "$cidr" 2>/dev/null | awk '/via/{print $3; exit}')
+    fi
+    printf '%s|%s|%s|%s\n' "${iface:-?}" "$cidr" "${selfip:-?}" "${gw:-?}"
+  done
+}
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT="${OUT_BASE}/${STAMP}"
@@ -104,10 +150,12 @@ oui_lookup() {
 }
 
 # ---------- capture context ----------
+CIDR_SHOW=$(printf '%s ' "${CIDRS[@]}" | sed 's/ $//')
+build_net_meta > "${OUT}/raw/networks.tsv"
 {
   echo "stamp=$STAMP"
   echo "mode=$MODE"
-  echo "cidr=$CIDR"
+  echo "cidrs=${CIDR_SHOW}"
   echo "iface=$IFACE"
   echo "gateway=$GW"
   echo "self_ip=$SELF_IP"
@@ -115,30 +163,63 @@ oui_lookup() {
   echo "hostname=$HOSTNAME_NOW"
   echo "lan_stealth=$( [[ -f /run/privacy-lan-stealth/active ]] && echo on || echo off )"
   echo "torvpn=$( [[ -f /run/privacy-torvpn/active ]] && echo on || echo off )"
+  echo "networks:"
+  sed 's/^/  /' "${OUT}/raw/networks.tsv"
 } > "${OUT}/raw/context.env"
 
-notify "LAN Audit" "Escaneando ${CIDR} (${MODE})…"
-log "Auditoría ${MODE} de ${CIDR} → ${OUT}"
+notify "LAN Audit" "Escaneando ${#CIDRS[@]} red(es) (${MODE})…"
+log "Auditoría ${MODE} de ${#CIDRS[@]} red(es): ${CIDR_SHOW} → ${OUT}"
+while IFS='|' read -r nif ncidr nself ngw; do
+  log "  iface=${nif} cidr=${ncidr} self=${nself} gw=${ngw}"
+done < "${OUT}/raw/networks.tsv"
 
-# ---------- host discovery ----------
+# ---------- host discovery (all CIDRs) ----------
 log "Descubrimiento de hosts…"
-nmap -sn -PE -PP -PS22,80,443,445,8080,8443 -PA80,443 \
-  --max-retries 2 -T3 \
-  -oG "${OUT}/nmap/hosts.gnmap" \
-  -oN "${OUT}/nmap/hosts.nmap" \
-  "$CIDR" >/dev/null
+: > "${OUT}/nmap/hosts.gnmap"
+: > "${OUT}/nmap/hosts.nmap"
+HOSTS=()
+declare -A HOST_NET=()
 
-mapfile -t HOSTS < <(awk '/Up$/{print $2}' "${OUT}/nmap/hosts.gnmap" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
-# Always include gateway if known
-if [[ -n "$GW" ]] && ! printf '%s\n' "${HOSTS[@]:-}" | grep -qx "$GW"; then
-  HOSTS+=("$GW")
-fi
+for cidr in "${CIDRS[@]}"; do
+  safe=$(echo "$cidr" | tr '/.' '_')
+  log "  scanning ${cidr}…"
+  nmap -sn -PE -PP -PS22,80,443,445,8080,8443 -PA80,443 \
+    --max-retries 2 -T3 \
+    -oG "${OUT}/nmap/hosts-${safe}.gnmap" \
+    -oN "${OUT}/nmap/hosts-${safe}.nmap" \
+    "$cidr" >/dev/null || true
+  cat "${OUT}/nmap/hosts-${safe}.gnmap" >> "${OUT}/nmap/hosts.gnmap" 2>/dev/null || true
+  {
+    echo "##### ${cidr}"
+    cat "${OUT}/nmap/hosts-${safe}.nmap" 2>/dev/null || true
+    echo
+  } >> "${OUT}/nmap/hosts.nmap"
+  while read -r hip; do
+    [[ -z "$hip" ]] && continue
+    if [[ -z "${HOST_NET[$hip]+x}" ]]; then
+      HOSTS+=("$hip")
+      HOST_NET[$hip]=$cidr
+    fi
+  done < <(awk '/Up$/{print $2}' "${OUT}/nmap/hosts-${safe}.gnmap" 2>/dev/null)
+done
 
-[[ ${#HOSTS[@]} -gt 0 ]] || die "ningún host vivo en ${CIDR}"
+# Include gateways from every network
+while IFS='|' read -r _nif _ncidr _nself ngw; do
+  [[ -z "$ngw" || "$ngw" == "?" ]] && continue
+  if [[ -z "${HOST_NET[$ngw]+x}" ]]; then
+    HOSTS+=("$ngw")
+    HOST_NET[$ngw]=${_ncidr}
+  fi
+done < "${OUT}/raw/networks.tsv"
+
+# Sort hosts
+mapfile -t HOSTS < <(printf '%s\n' "${HOSTS[@]:-}" | awk 'NF' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+
+[[ ${#HOSTS[@]} -gt 0 ]] || die "ningún host vivo en: ${CIDR_SHOW}"
 HOST_LIST_SHOW=$(printf '%s,' "${HOSTS[@]}" | sed 's/,$//')
-log "Hosts vivos: ${#HOSTS[@]} → ${HOST_LIST_SHOW}"
+log "Hosts vivos (todas las redes): ${#HOSTS[@]} → ${HOST_LIST_SHOW}"
 
-# ARP / neigh enrichment
+# ARP / neigh enrichment (all interfaces)
 ip neigh show > "${OUT}/raw/neigh.txt" || true
 
 # ---------- port / service scan ----------
@@ -218,11 +299,12 @@ if [[ -f "${OUT}/nmap/services.gnmap" ]]; then
     }' "${OUT}/nmap/services.gnmap" 2>/dev/null || true)
 fi
 
-# Always probe gateway admin
-if [[ -n "$GW" ]]; then
-  http_probe "$GW" 80 http
-  http_probe "$GW" 443 https
-fi
+# Always probe gateway admin(s) on every scanned network
+while IFS='|' read -r _nif _ncidr _nself ngw; do
+  [[ -z "$ngw" || "$ngw" == "?" ]] && continue
+  http_probe "$ngw" 80 http
+  http_probe "$ngw" 443 https
+done < "${OUT}/raw/networks.tsv"
 
 # ---------- Bluetooth ----------
 BT_REPORT="${OUT}/raw/bluetooth.txt"
@@ -368,24 +450,29 @@ while IFS= read -r line; do
   fi
 done < "${OUT}/nmap/iot-ports.nmap"
 
-# Gateway-specific
-if [[ -n "$GW" ]]; then
-  if grep -qi 'Arcadyan\|login\.htm\|Router\|Gateway' "${OUT}/raw/http-${GW}-80.txt" 2>/dev/null \
-    || grep -qi 'login' "${OUT}/raw/http-${GW}-443.txt" 2>/dev/null; then
-    add_finding MEDIUM "$GW" "Panel admin del router en LAN" "Cambiar password por defecto; desactivar admin WAN/WPS/UPnP si no hace falta"
+# Gateway-specific (all networks)
+GATEWAYS=()
+while IFS='|' read -r _nif _ncidr _nself ngw; do
+  [[ -z "$ngw" || "$ngw" == "?" ]] && continue
+  GATEWAYS+=("$ngw")
+  if grep -qi 'Arcadyan\|login\.htm\|Router\|Gateway' "${OUT}/raw/http-${ngw}-80.txt" 2>/dev/null \
+    || grep -qi 'login' "${OUT}/raw/http-${ngw}-443.txt" 2>/dev/null; then
+    add_finding MEDIUM "$ngw" "Panel admin del router en LAN" "Red ${_ncidr} — cambiar password; desactivar admin WAN/WPS/UPnP si no hace falta"
   fi
-  if grep -qi 'telnet' "${OUT}/nmap/services.nmap" 2>/dev/null; then
-    :
-  fi
-fi
+done < "${OUT}/raw/networks.tsv"
+
+is_gateway() {
+  local ip=$1 g
+  for g in "${GATEWAYS[@]:-}"; do [[ "$ip" == "$g" ]] && return 0; done
+  return 1
+}
 
 # Open HTTP without HTTPS only on devices
 while read -r hip; do
   [[ -z "$hip" ]] && continue
   open_http=$(rg -N "^${hip} .*Ports:.*[0-9]+/open/(http|http-alt)" "${OUT}/nmap/services.gnmap" 2>/dev/null || true)
   if [[ -n "$open_http" ]]; then
-    # Skip if only gateway (expected)
-    if [[ "$hip" != "$GW" ]]; then
+    if ! is_gateway "$hip"; then
       add_finding MEDIUM "$hip" "Interfaz HTTP en dispositivo" "Servicio web en LAN — revisar auth y firmware"
     fi
   fi
@@ -429,7 +516,10 @@ done
 
 # ---------- Build inventory table ----------
 INV="${OUT}/raw/inventory.tsv"
-echo -e "ip\tmac\tvendor\topen_ports\tnotes" > "$INV"
+echo -e "ip\tnetwork\tmac\tvendor\topen_ports\tnotes" > "$INV"
+
+# All our own IPs across interfaces
+mapfile -t SELF_IPS < <(ip -4 -o addr show scope global up 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
 
 for hip in "${HOSTS[@]}"; do
   mac=$(awk -v ip="$hip" '$1==ip && $5 ~ /:/ {print $5; exit}' "${OUT}/raw/neigh.txt" 2>/dev/null || true)
@@ -447,7 +537,6 @@ for hip in "${HOSTS[@]}"; do
     }
     END{print out}
   ' "${OUT}/nmap/services.nmap" 2>/dev/null)
-  # merge iot opens
   iot_ports=$(awk -v ip="$hip" '
     $0 ~ "^Nmap scan report for "ip"( |$)" {p=1; next}
     p && /^Nmap scan report for / {exit}
@@ -457,12 +546,14 @@ for hip in "${HOSTS[@]}"; do
   if [[ -n "${iot_ports}" ]]; then
     ports="${ports:+$ports, }${iot_ports}"
   fi
-  # dedupe-ish empty
   ports=${ports:-—}
+  net="${HOST_NET[$hip]:-unknown}"
   notes=""
-  [[ "$hip" == "$GW" ]] && notes="gateway"
-  [[ "$hip" == "$SELF_IP" ]] && notes="este equipo"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$hip" "$mac" "$vendor" "$ports" "$notes" >> "$INV"
+  is_gateway "$hip" && notes="gateway"
+  for sip in "${SELF_IPS[@]:-}"; do
+    [[ "$hip" == "$sip" ]] && notes="este equipo"
+  done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$hip" "$net" "$mac" "$vendor" "$ports" "$notes" >> "$INV"
 done
 
 # ---------- Markdown report ----------
@@ -472,9 +563,12 @@ log "Generando informe…"
   echo
   echo "- **Fecha:** $(date -Is)"
   echo "- **Modo:** ${MODE}"
-  echo "- **Red:** \`${CIDR}\` (iface \`${IFACE}\`)"
-  echo "- **Gateway:** \`${GW}\`"
-  echo "- **Este equipo:** \`${SELF_IP}\` MAC \`${SELF_MAC}\` hostname \`${HOSTNAME_NOW}\`"
+  echo "- **Redes:** \`${CIDR_SHOW}\`"
+  echo "- **Ifaces / gateways:**"
+  while IFS='|' read -r nif ncidr nself ngw; do
+    echo "  - \`${nif}\` → \`${ncidr}\` (self \`${nself}\`, gw \`${ngw}\`)"
+  done < "${OUT}/raw/networks.tsv"
+  echo "- **Este equipo (default):** \`${SELF_IP}\` MAC \`${SELF_MAC}\` hostname \`${HOSTNAME_NOW}\`"
   echo "- **LAN stealth:** $( [[ -f /run/privacy-lan-stealth/active ]] && echo ON || echo off )"
   echo "- **Tor VPN:** $( [[ -f /run/privacy-torvpn/active ]] && echo ON || echo off )"
   echo "- **Salida:** \`${OUT}\`"
@@ -502,10 +596,10 @@ log "Generando informe…"
 
   echo "## Inventario de equipos"
   echo
-  echo "| IP | MAC | Fabricante | Puertos abiertos | Notas |"
-  echo "|----|-----|------------|------------------|-------|"
-  tail -n +2 "$INV" | while IFS=$'\t' read -r ip mac vendor ports notes; do
-    echo "| \`${ip}\` | \`${mac}\` | ${vendor} | \`${ports}\` | ${notes} |"
+  echo "| IP | Red | MAC | Fabricante | Puertos abiertos | Notas |"
+  echo "|----|-----|-----|------------|------------------|-------|"
+  tail -n +2 "$INV" | while IFS=$'\t' read -r ip net mac vendor ports notes; do
+    echo "| \`${ip}\` | \`${net}\` | \`${mac}\` | ${vendor} | \`${ports}\` | ${notes} |"
   done
   echo
 
@@ -576,7 +670,7 @@ log "Generando informe…"
 # Also write a short text summary
 {
   echo "lan-audit ${STAMP}"
-  echo "CIDR=${CIDR} hosts=${#HOSTS[@]} mode=${MODE}"
+  echo "CIDRS=${CIDR_SHOW} hosts=${#HOSTS[@]} mode=${MODE}"
   echo "CRITICAL=${crit} HIGH=${high} MEDIUM=${med} LOW=${low} INFO=${info}"
   echo "report=${REPORT}"
 } > "${OUT}/SUMMARY.txt"
