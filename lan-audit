@@ -258,10 +258,10 @@ if [[ "$DO_BT" == 1 ]] && command -v bluetoothctl >/dev/null; then
     echo
     echo "## Details"
   } >> "$BT_REPORT"
-  bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+  bluetoothctl devices 2>/dev/null | awk '/^Device / && $2 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ {print $2}' | while read -r mac; do
     {
       echo "### $mac"
-      bluetoothctl info "$mac" 2>&1
+      bluetoothctl info "$mac" 2>&1 || true
       echo
     } >> "$BT_REPORT"
   done
@@ -406,8 +406,10 @@ if [[ -f "$BT_REPORT" ]] && ! grep -q 'omitido' "$BT_REPORT"; then
       name=$(bluetoothctl info "$mac" 2>/dev/null | awk -F': ' '/^\s*Name:/{print $2; exit}')
       add_finding INFO "bluetooth" "Dispositivo BT emparejado" "${name:-$mac}"
     fi
-  done < <(awk '/^Device /{print $2}' "$BT_REPORT" 2>/dev/null | sort -u)
+  done < <(awk '/^Device / && $2 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ {print $2}' "$BT_REPORT" 2>/dev/null | sort -u)
 fi
+# BT section must not abort the whole audit
+true
 
 # Host with no open ports — note only
 for hip in "${HOSTS[@]}"; do
