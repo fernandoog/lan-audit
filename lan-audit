@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+# lan-audit — auditoría defensiva de LAN + Bluetooth + informe de riesgos
+# Uso: lan-audit [--quick|--full] [--no-bt] [--cidr 192.168.1.0/24] [--out DIR]
+set -euo pipefail
+
+VERSION=1.1.0
+MODE=full          # quick|full
+DO_BT=1
+CIDR=""
+OUT_BASE="${HOME}/.local/share/lan-audits"
+NOTIFY=${NOTIFY:-1}
+TOP_PORTS=1000
+SCRIPT_SAFE=1      # nmap safe/discovery scripts only (no exploit)
+
+usage() {
+  cat <<EOF
+lan-audit v${VERSION} — inventario LAN/BT + informe de vulnerabilidades
+
+Usage:
+  lan-audit [--quick|--full] [--no-bt] [--cidr X.X.X.0/24] [--out DIR]
+
+  --quick   Host discovery + top-200 ports (más rápido)
+  --full    Top-1000 ports + banners HTTP/SSL + scripts NSE seguros (default)
+  --no-bt   Saltar escaneo Bluetooth
+  --cidr    Red a auditar (default: detecta la Wi-Fi/Ethernet activa)
+  --out     Directorio base de informes (default: ~/.local/share/lan-audits)
+
+EOF
+}
+
+notify() {
+  [[ "$NOTIFY" == "1" ]] || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a lan-audit "$1" "$2" || true
+}
+
+log() { printf '[*] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die() { printf '[x] %s\n' "$*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quick) MODE=quick; TOP_PORTS=200; shift ;;
+    --full) MODE=full; TOP_PORTS=1000; shift ;;
+    --no-bt) DO_BT=0; shift ;;
+    --cidr) CIDR=${2:-}; shift 2 ;;
+    --out) OUT_BASE=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; die "opción desconocida: $1" ;;
+  esac
+done
+
+command -v nmap >/dev/null || die "nmap no instalado (pacman -S nmap)"
+command -v ip >/dev/null || die "iproute2 requerido"
+
+detect_cidr() {
+  local iface gw
+  iface=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+  [[ -n "$iface" ]] || die "no hay ruta default — ¿conectado a Wi-Fi?"
+  ip -4 -o addr show dev "$iface" 2>/dev/null \
+    | awk '{print $4; exit}' \
+    | awk -F'[./]' '{
+        ip=sprintf("%d.%d.%d.0", $1,$2,$3)
+        # assume /24 for typical home Wi-Fi if prefix odd
+        p=$5+0; if(p<8||p>30) p=24
+        print ip "/" p
+      }'
+}
+
+IFACE=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+GW=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+SELF_IP=$(ip -4 -o addr show dev "${IFACE:-lo}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+SELF_MAC=$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null || echo unknown)
+HOSTNAME_NOW=$(hostname 2>/dev/null || echo unknown)
+
+if [[ -z "$CIDR" ]]; then
+  CIDR=$(detect_cidr)
+fi
+[[ -n "$CIDR" ]] || die "no se pudo detectar CIDR"
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_BASE}/${STAMP}"
+mkdir -p "$OUT"/{raw,nmap}
+REPORT="${OUT}/INFORME.md"
+FINDINGS="${OUT}/findings.tsv"
+: > "$FINDINGS"
+
+add_finding() {
+  # severity|host|title|detail
+  local sev=$1 host=$2 title=$3 detail=$4
+  printf '%s\t%s\t%s\t%s\n' "$sev" "$host" "$title" "$detail" >> "$FINDINGS"
+}
+
+oui_lookup() {
+  local mac=$1
+  local oui
+  oui=$(echo "$mac" | tr -d ':-' | cut -c1-6 | tr 'a-f' 'A-F')
+  if [[ -f /usr/share/nmap/nmap-mac-prefixes ]]; then
+    awk -v o="$oui" 'toupper($1)==o{$1=""; sub(/^ /,""); print; exit}' /usr/share/nmap/nmap-mac-prefixes \
+      || echo "OUI desconocido ($oui)"
+  else
+    echo "OUI $oui"
+  fi
+}
+
+# ---------- capture context ----------
+{
+  echo "stamp=$STAMP"
+  echo "mode=$MODE"
+  echo "cidr=$CIDR"
+  echo "iface=$IFACE"
+  echo "gateway=$GW"
+  echo "self_ip=$SELF_IP"
+  echo "self_mac=$SELF_MAC"
+  echo "hostname=$HOSTNAME_NOW"
+  echo "lan_stealth=$( [[ -f /run/privacy-lan-stealth/active ]] && echo on || echo off )"
+  echo "torvpn=$( [[ -f /run/privacy-torvpn/active ]] && echo on || echo off )"
+} > "${OUT}/raw/context.env"
+
+notify "LAN Audit" "Escaneando ${CIDR} (${MODE})…"
+log "Auditoría ${MODE} de ${CIDR} → ${OUT}"
+
+# ---------- host discovery ----------
+log "Descubrimiento de hosts…"
+nmap -sn -PE -PP -PS22,80,443,445,8080,8443 -PA80,443 \
+  --max-retries 2 -T3 \
+  -oG "${OUT}/nmap/hosts.gnmap" \
+  -oN "${OUT}/nmap/hosts.nmap" \
+  "$CIDR" >/dev/null
+
+mapfile -t HOSTS < <(awk '/Up$/{print $2}' "${OUT}/nmap/hosts.gnmap" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+# Always include gateway if known
+if [[ -n "$GW" ]] && ! printf '%s\n' "${HOSTS[@]:-}" | grep -qx "$GW"; then
+  HOSTS+=("$GW")
+fi
+
+[[ ${#HOSTS[@]} -gt 0 ]] || die "ningún host vivo en ${CIDR}"
+HOST_LIST_SHOW=$(printf '%s,' "${HOSTS[@]}" | sed 's/,$//')
+log "Hosts vivos: ${#HOSTS[@]} → ${HOST_LIST_SHOW}"
+
+# ARP / neigh enrichment
+ip neigh show > "${OUT}/raw/neigh.txt" || true
+
+# ---------- port / service scan ----------
+log "Escaneo de servicios (top ${TOP_PORTS})…"
+NMAP_EXTRA=()
+if [[ "$MODE" == full && "$SCRIPT_SAFE" == 1 ]]; then
+  NMAP_EXTRA+=(--script "default,discovery,safe")
+fi
+
+nmap -sT -sV --top-ports "$TOP_PORTS" -T3 --max-retries 2 --version-intensity 5 \
+  "${NMAP_EXTRA[@]}" \
+  -oA "${OUT}/nmap/services" \
+  "${HOSTS[@]}" >/dev/null || true
+
+# Extra IoT / risky ports always
+log "Puertos IoT / riesgosos…"
+nmap -sT -T3 -p 21,22,23,25,139,445,554,631,1883,1900,2323,5000,5353,5555,7547,8000,8080,8081,8443,8888,9000,9100,49152,32400 \
+  -oN "${OUT}/nmap/iot-ports.nmap" \
+  "${HOSTS[@]}" >/dev/null || true
+
+# ---------- HTTP / TLS banners ----------
+http_probe() {
+  local ip=$1 port=$2 scheme=$3
+  local outf="${OUT}/raw/http-${ip}-${port}.txt"
+  {
+    echo "### ${scheme}://${ip}:${port}"
+    curl -skI --max-time 5 --connect-timeout 3 "${scheme}://${ip}:${port}/" 2>&1 | head -30
+    echo
+    curl -sk --max-time 5 --connect-timeout 3 "${scheme}://${ip}:${port}/" 2>&1 | head -c 800
+    echo
+  } > "$outf" || true
+}
+
+log "Banners HTTP/HTTPS…"
+while read -r line; do
+  # From services.nmap: PORT STATE SERVICE
+  if [[ "$line" =~ ^([0-9]+)/tcp[[:space:]]+open[[:space:]]+(ssl/)?(http|https|http-alt|https-alt|www|opentracker) ]]; then
+    :
+  fi
+done < /dev/null
+
+# Parse open http-ish ports from gnmap
+if [[ -f "${OUT}/nmap/services.gnmap" ]]; then
+  while read -r hip ports; do
+    [[ -z "$hip" ]] && continue
+    IFS=',' read -ra parr <<< "$ports"
+    for p in "${parr[@]}"; do
+      port=${p%%/*}
+      state=${p#*/}; state=${state%%/*}
+      proto=${p##*/}
+      [[ "$state" == "open" ]] || continue
+      case "$proto" in
+        http|http-alt|www|http-proxy|opentracker)
+          http_probe "$hip" "$port" http
+          ;;
+        https|https-alt|ssl|ssl/http|ssl/https)
+          http_probe "$hip" "$port" https
+          # cert summary
+          echo | timeout 5 openssl s_client -connect "${hip}:${port}" -servername "$hip" 2>/dev/null \
+            | openssl x509 -noout -subject -issuer -dates 2>/dev/null \
+            > "${OUT}/raw/cert-${hip}-${port}.txt" || true
+          ;;
+      esac
+      # Also probe common web ports even if service name odd
+      if [[ "$port" =~ ^(80|443|8000|8080|8081|8443|8888|49152)$ ]]; then
+        if [[ "$port" == 443 || "$port" == 8443 ]]; then
+          http_probe "$hip" "$port" https
+        else
+          http_probe "$hip" "$port" http
+        fi
+      fi
+    done
+  done < <(awk -F'[ ()]' '/Ports:/{
+      host=$2
+      sub(/.*Ports: /,"")
+      print host, $0
+    }' "${OUT}/nmap/services.gnmap" 2>/dev/null || true)
+fi
+
+# Always probe gateway admin
+if [[ -n "$GW" ]]; then
+  http_probe "$GW" 80 http
+  http_probe "$GW" 443 https
+fi
+
+# ---------- Bluetooth ----------
+BT_REPORT="${OUT}/raw/bluetooth.txt"
+BT_WAS_BLOCKED=0
+BT_WAS_OFF=0
+if [[ "$DO_BT" == 1 ]] && command -v bluetoothctl >/dev/null; then
+  log "Escaneo Bluetooth…"
+  {
+    echo "# Bluetooth scan $(date -Is)"
+    echo
+  } > "$BT_REPORT"
+
+  if rfkill list bluetooth 2>/dev/null | grep -qi 'Soft blocked: yes'; then
+    BT_WAS_BLOCKED=1
+    rfkill unblock bluetooth 2>/dev/null || true
+  fi
+  if bluetoothctl show 2>/dev/null | grep -qi 'Powered: no'; then
+    BT_WAS_OFF=1
+  fi
+  bluetoothctl power on >/dev/null 2>&1 || true
+  sleep 1
+  {
+    echo "## Controller"
+    bluetoothctl show 2>&1
+    echo
+    echo "## Scan (18s)"
+  } >> "$BT_REPORT"
+  timeout 20 bluetoothctl --timeout 18 scan on >> "$BT_REPORT" 2>&1 || true
+  {
+    echo
+    echo "## Devices"
+    bluetoothctl devices 2>&1
+    echo
+    echo "## Details"
+  } >> "$BT_REPORT"
+  bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+    {
+      echo "### $mac"
+      bluetoothctl info "$mac" 2>&1
+      echo
+    } >> "$BT_REPORT"
+  done
+
+  # Restore previous BT state (stealth-friendly)
+  if [[ "$BT_WAS_OFF" == 1 ]]; then
+    bluetoothctl power off >/dev/null 2>&1 || true
+  fi
+  if [[ "$BT_WAS_BLOCKED" == 1 ]]; then
+    rfkill block bluetooth >/dev/null 2>&1 || true
+  fi
+else
+  echo "(Bluetooth omitido)" > "$BT_REPORT"
+fi
+
+# ---------- Heuristic vulnerability findings ----------
+log "Analizando hallazgos…"
+
+# Per-host from services.nmap (+ fingerprints SF-*)
+CURRENT_HOST=""
+HOST_BLOCK=""
+flush_host_block() {
+  local host=$1 block=$2
+  [[ -z "$host" || -z "$block" ]] && return 0
+
+  # nmap SF fingerprints escape dots as \. → match both forms
+  if echo "$block" | grep -Eqi 'Linux/4\\?\.?4'; then
+    add_finding CRITICAL "$host" "Firmware IoT con Linux 4.4.x" "Kernel EOL en banner/fingerprint — candidato a botnet / RCE"
+  elif echo "$block" | grep -Eqi 'Linux/[23]\\?\.|Linux/4\\?\.[0-3]'; then
+    add_finding HIGH "$host" "Kernel Linux antiguo en banner" "Fingerprint/banner con kernel EOL"
+  fi
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([0-9]+)/tcp[[:space:]]+open[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$ ]] || continue
+    local port="${BASH_REMATCH[1]}"
+    local svc="${BASH_REMATCH[2]}"
+    local rest="${BASH_REMATCH[3]}"
+    case "$port" in
+      23|2323)
+        add_finding CRITICAL "$host" "Telnet abierto (:${port})" "Servicio inseguro en claro: ${svc} ${rest}"
+        ;;
+      21)
+        add_finding HIGH "$host" "FTP abierto" "FTP suele ser claro/credenciales débiles: ${rest}"
+        ;;
+      445|139)
+        add_finding HIGH "$host" "SMB/NetBIOS expuesto" "Puerto ${port} abierto — revisar shares y autenticación"
+        ;;
+      22)
+        add_finding MEDIUM "$host" "SSH expuesto en LAN" "Asegurar claves fuertes: ${rest}"
+        ;;
+      554)
+        add_finding MEDIUM "$host" "RTSP (posible cámara)" "Stream de cámara en LAN: ${rest}"
+        ;;
+      1883)
+        add_finding MEDIUM "$host" "MQTT expuesto" "Broker IoT sin TLS habitualmente"
+        ;;
+      1900|5000)
+        add_finding MEDIUM "$host" "UPnP/SSDP" "Superficie de descubrimiento / posible port-mapping"
+        ;;
+      5555)
+        add_finding HIGH "$host" "ADB (5555) abierto" "Depuración Android en red — riesgo alto"
+        ;;
+      7547)
+        add_finding HIGH "$host" "TR-069/CWMP (:7547)" "Gestión remota ISP — historial de abusos"
+        ;;
+      9100)
+        add_finding LOW "$host" "Puerto de impresora JetDirect" "Impresión raw en red"
+        ;;
+      49152)
+        add_finding MEDIUM "$host" "HTTP embebido en puerto alto (:49152)" "Típico de IoT/UPnP — revisar firmware"
+        ;;
+    esac
+  done <<< "$block"
+}
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^Nmap\ scan\ report\ for\ (.+)$ ]]; then
+    next_host="${BASH_REMATCH[1]}"
+    next_host=${next_host%% *}
+    flush_host_block "$CURRENT_HOST" "$HOST_BLOCK"
+    CURRENT_HOST="$next_host"
+    HOST_BLOCK=""
+    continue
+  fi
+  [[ -n "$CURRENT_HOST" ]] || continue
+  HOST_BLOCK+="$line"$'\n'
+done < "${OUT}/nmap/services.nmap"
+flush_host_block "$CURRENT_HOST" "$HOST_BLOCK"
+
+# Also mine iot-ports.nmap for risky opens missed by top-ports
+CURRENT_HOST=""
+while IFS= read -r line; do
+  if [[ "$line" =~ ^Nmap\ scan\ report\ for\ (.+)$ ]]; then
+    CURRENT_HOST="${BASH_REMATCH[1]}"; CURRENT_HOST=${CURRENT_HOST%% *}; continue
+  fi
+  [[ -z "$CURRENT_HOST" ]] && continue
+  if [[ "$line" =~ ^([0-9]+)/tcp[[:space:]]+open ]]; then
+    port="${BASH_REMATCH[1]}"
+    case "$port" in
+      23|2323|5555|7547|445)
+        add_finding HIGH "$CURRENT_HOST" "Puerto de riesgo abierto (:${port})" "Detectado en barrido IoT"
+        ;;
+    esac
+  fi
+done < "${OUT}/nmap/iot-ports.nmap"
+
+# Gateway-specific
+if [[ -n "$GW" ]]; then
+  if grep -qi 'Arcadyan\|login\.htm\|Router\|Gateway' "${OUT}/raw/http-${GW}-80.txt" 2>/dev/null \
+    || grep -qi 'login' "${OUT}/raw/http-${GW}-443.txt" 2>/dev/null; then
+    add_finding MEDIUM "$GW" "Panel admin del router en LAN" "Cambiar password por defecto; desactivar admin WAN/WPS/UPnP si no hace falta"
+  fi
+  if grep -qi 'telnet' "${OUT}/nmap/services.nmap" 2>/dev/null; then
+    :
+  fi
+fi
+
+# Open HTTP without HTTPS only on devices
+while read -r hip; do
+  [[ -z "$hip" ]] && continue
+  open_http=$(rg -N "^${hip} .*Ports:.*[0-9]+/open/(http|http-alt)" "${OUT}/nmap/services.gnmap" 2>/dev/null || true)
+  if [[ -n "$open_http" ]]; then
+    # Skip if only gateway (expected)
+    if [[ "$hip" != "$GW" ]]; then
+      add_finding MEDIUM "$hip" "Interfaz HTTP en dispositivo" "Servicio web en LAN — revisar auth y firmware"
+    fi
+  fi
+done <<< "$(printf '%s\n' "${HOSTS[@]}")"
+
+# Bluetooth findings
+if [[ -f "$BT_REPORT" ]] && ! grep -q 'omitido' "$BT_REPORT"; then
+  if grep -qi 'Name: chuwi\|Alias: chuwi' "$BT_REPORT"; then
+    add_finding MEDIUM "bluetooth-local" "Adaptador BT anuncia nombre 'chuwi'" "LAN stealth no oculta el nombre Bluetooth — renombrar alias"
+  fi
+  if grep -qi 'ManufacturerData.Key: 0x004c\|ManufacturerData.Key: 0x004C' "$BT_REPORT"; then
+    add_finding INFO "bluetooth" "Dispositivo Apple en rango" "Manufacturer 0x004C (Apple) — normal si hay iPhone/AirPods cerca"
+  fi
+  # Paired devices (skip controller Name/Alias)
+  while read -r mac; do
+    [[ -z "$mac" ]] && continue
+    if bluetoothctl info "$mac" 2>/dev/null | grep -qi 'Paired: yes'; then
+      name=$(bluetoothctl info "$mac" 2>/dev/null | awk -F': ' '/^\s*Name:/{print $2; exit}')
+      add_finding INFO "bluetooth" "Dispositivo BT emparejado" "${name:-$mac}"
+    fi
+  done < <(awk '/^Device /{print $2}' "$BT_REPORT" 2>/dev/null | sort -u)
+fi
+
+# Host with no open ports — note only
+for hip in "${HOSTS[@]}"; do
+  if ! rg -q "^Host: ${hip} .*Ports:.*open/" "${OUT}/nmap/services.gnmap" 2>/dev/null; then
+    # check iot file
+    if ! rg -q "Nmap scan report for ${hip}" "${OUT}/nmap/iot-ports.nmap" 2>/dev/null \
+      || ! awk -v h="$hip" '
+          $0 ~ "report for "h {p=1; next}
+          p && /^Nmap scan report/ {exit}
+          p && /open/ {found=1}
+          END{exit !found}
+        ' "${OUT}/nmap/iot-ports.nmap" 2>/dev/null; then
+      add_finding INFO "$hip" "Sin puertos TCP abiertos (top scan)" "Perfil cerrado o host dormido / solo cliente"
+    fi
+  fi
+done
+
+# ---------- Build inventory table ----------
+INV="${OUT}/raw/inventory.tsv"
+echo -e "ip\tmac\tvendor\topen_ports\tnotes" > "$INV"
+
+for hip in "${HOSTS[@]}"; do
+  mac=$(awk -v ip="$hip" '$1==ip && $5 ~ /:/ {print $5; exit}' "${OUT}/raw/neigh.txt" 2>/dev/null || true)
+  [[ -z "$mac" || "$mac" == "FAILED" ]] && mac="—"
+  if [[ "$mac" != "—" ]]; then
+    vendor=$(oui_lookup "$mac")
+  else
+    vendor="—"
+  fi
+  ports=$(awk -v ip="$hip" '
+    $0 ~ "^Nmap scan report for "ip"( |$)" {p=1; next}
+    p && /^Nmap scan report for / {exit}
+    p && /^[0-9]+\/tcp/ && $2=="open" {
+      svc=$3; if(out!="") out=out", "; out=out $1"="svc
+    }
+    END{print out}
+  ' "${OUT}/nmap/services.nmap" 2>/dev/null)
+  # merge iot opens
+  iot_ports=$(awk -v ip="$hip" '
+    $0 ~ "^Nmap scan report for "ip"( |$)" {p=1; next}
+    p && /^Nmap scan report for / {exit}
+    p && /^[0-9]+\/tcp/ && $2=="open" { if(out!="") out=out", "; out=out $1 }
+    END{print out}
+  ' "${OUT}/nmap/iot-ports.nmap" 2>/dev/null)
+  if [[ -n "${iot_ports}" ]]; then
+    ports="${ports:+$ports, }${iot_ports}"
+  fi
+  # dedupe-ish empty
+  ports=${ports:-—}
+  notes=""
+  [[ "$hip" == "$GW" ]] && notes="gateway"
+  [[ "$hip" == "$SELF_IP" ]] && notes="este equipo"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$hip" "$mac" "$vendor" "$ports" "$notes" >> "$INV"
+done
+
+# ---------- Markdown report ----------
+log "Generando informe…"
+{
+  echo "# Informe de auditoría LAN / Bluetooth"
+  echo
+  echo "- **Fecha:** $(date -Is)"
+  echo "- **Modo:** ${MODE}"
+  echo "- **Red:** \`${CIDR}\` (iface \`${IFACE}\`)"
+  echo "- **Gateway:** \`${GW}\`"
+  echo "- **Este equipo:** \`${SELF_IP}\` MAC \`${SELF_MAC}\` hostname \`${HOSTNAME_NOW}\`"
+  echo "- **LAN stealth:** $( [[ -f /run/privacy-lan-stealth/active ]] && echo ON || echo off )"
+  echo "- **Tor VPN:** $( [[ -f /run/privacy-torvpn/active ]] && echo ON || echo off )"
+  echo "- **Salida:** \`${OUT}\`"
+  echo
+  echo "> Auditoría **defensiva** de tu propia red. No incluye exploits ni PoCs ofensivos."
+  echo
+
+  echo "## Resumen ejecutivo"
+  echo
+  crit=$(awk -F'\t' '$1=="CRITICAL"{c++} END{print c+0}' "$FINDINGS")
+  high=$(awk -F'\t' '$1=="HIGH"{c++} END{print c+0}' "$FINDINGS")
+  med=$(awk -F'\t' '$1=="MEDIUM"{c++} END{print c+0}' "$FINDINGS")
+  low=$(awk -F'\t' '$1=="LOW"{c++} END{print c+0}' "$FINDINGS")
+  info=$(awk -F'\t' '$1=="INFO"{c++} END{print c+0}' "$FINDINGS")
+  echo "| Severidad | Cantidad |"
+  echo "|-----------|----------|"
+  echo "| CRITICAL  | ${crit} |"
+  echo "| HIGH      | ${high} |"
+  echo "| MEDIUM    | ${med} |"
+  echo "| LOW       | ${low} |"
+  echo "| INFO      | ${info} |"
+  echo
+  echo "**Hosts vivos:** ${#HOSTS[@]}"
+  echo
+
+  echo "## Inventario de equipos"
+  echo
+  echo "| IP | MAC | Fabricante | Puertos abiertos | Notas |"
+  echo "|----|-----|------------|------------------|-------|"
+  tail -n +2 "$INV" | while IFS=$'\t' read -r ip mac vendor ports notes; do
+    echo "| \`${ip}\` | \`${mac}\` | ${vendor} | \`${ports}\` | ${notes} |"
+  done
+  echo
+
+  echo "## Vulnerabilidades y riesgos"
+  echo
+  if [[ ! -s "$FINDINGS" ]]; then
+    echo "_No se generaron hallazgos heurísticos (red muy cerrada o escaneo limitado)._"
+    echo
+  else
+    for sev in CRITICAL HIGH MEDIUM LOW INFO; do
+      if awk -F'\t' -v s="$sev" '$1==s{found=1} END{exit !found}' "$FINDINGS"; then
+        echo "### ${sev}"
+        echo
+        awk -F'\t' -v s="$sev" '$1==s{
+          printf "- **[%s]** %s — %s\n", $2, $3, $4
+        }' "$FINDINGS"
+        echo
+      fi
+    done
+  fi
+
+  echo "## Detalle por host (nmap)"
+  echo
+  echo '```'
+  # Compact open ports per host
+  awk '
+    /^Nmap scan report for /{host=$5; next}
+    /^[0-9]+\/tcp/{
+      if($2=="open"){
+        printf "%-16s %-8s %-18s %s\n", host, $1, $3, substr($0, index($0,$4))
+      }
+    }
+  ' "${OUT}/nmap/services.nmap" 2>/dev/null || cat "${OUT}/nmap/services.nmap"
+  echo '```'
+  echo
+
+  echo "## Bluetooth"
+  echo
+  if [[ "$DO_BT" != 1 ]]; then
+    echo "_Escaneo BT desactivado (--no-bt)._"
+  else
+    echo '```'
+    # Summarize controller + devices
+    rg -i 'Controller |Name:|Alias:|Powered:|Device |Paired:|Trusted:|Icon:|ManufacturerData.Key' "$BT_REPORT" 2>/dev/null | head -80 || head -60 "$BT_REPORT"
+    echo '```'
+  fi
+  echo
+
+  echo "## Recomendaciones prioritarias"
+  echo
+  echo "1. Aislar IoT (Tuya, LinkSprite, cámaras) en Wi‑Fi de invitados / VLAN."
+  echo "2. Actualizar o retirar dispositivos con kernels/firmware antiguos."
+  echo "3. Router: password admin fuerte, firmware al día, sin admin remoto WAN, revisar UPnP/WPS."
+  echo "4. Desactivar Telnet/FTP/ADB si aparecen abiertos."
+  echo "5. Con LAN stealth: renombrar también el alias Bluetooth (no dejar \`chuwi\`)."
+  echo "6. Re-auditar tras cambios: \`lan-audit --quick\`."
+  echo
+
+  echo "## Archivos generados"
+  echo
+  echo "- \`INFORME.md\` (este archivo)"
+  echo "- \`findings.tsv\`"
+  echo "- \`nmap/\` — salidas nmap"
+  echo "- \`raw/\` — banners HTTP, certs, neigh, bluetooth"
+  echo
+} > "$REPORT"
+
+# Also write a short text summary
+{
+  echo "lan-audit ${STAMP}"
+  echo "CIDR=${CIDR} hosts=${#HOSTS[@]} mode=${MODE}"
+  echo "CRITICAL=${crit} HIGH=${high} MEDIUM=${med} LOW=${low} INFO=${info}"
+  echo "report=${REPORT}"
+} > "${OUT}/SUMMARY.txt"
+
+log "Informe: ${REPORT}"
+notify "LAN Audit" "Listo: ${crit} crit / ${high} high — ${OUT}"
+
+# Print summary to stdout
+echo
+echo "========== RESUMEN =========="
+cat "${OUT}/SUMMARY.txt"
+echo
+echo "--- Hallazgos ---"
+if [[ -s "$FINDINGS" ]]; then
+  sort -t$'\t' -k1,1 "$FINDINGS" | while IFS=$'\t' read -r sev host title detail; do
+    printf '[%s] %s — %s\n    %s\n' "$sev" "$host" "$title" "$detail"
+  done
+else
+  echo "(sin hallazgos heurísticos)"
+fi
+echo
+echo "Informe completo: ${REPORT}"
+
+# Open hint
+if command -v xdg-open >/dev/null 2>&1; then
+  :
+fi
